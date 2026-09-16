@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+
+# install.sh build stamp (ensure_tmux_thumbs): the HEAD the binary was built from
+.built-from
