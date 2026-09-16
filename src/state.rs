@@ -20,7 +20,10 @@ const PATTERNS: [(&'static str, &'static str); 15] = [
   ("ipfs", r"Qm[0-9a-zA-Z]{44}"),
   ("sha", r"[0-9a-f]{7,40}"),
   ("ip", r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"),
-  ("ipv6", r"[A-f0-9:]+:+[A-f0-9:]+[%\w\d]+"),
+  // `[A-f]` was a RANGE, not a set of hex letters: A-f spans 0x41-0x66, so it
+  // also matched `[`, `\`, `]`, `^`, `_` and a backtick, and hinted things like
+  // `6:[A`. Narrowed to the letters an address can actually contain.
+  ("ipv6", r"[A-Fa-f0-9:]+:+[A-Fa-f0-9:]+[%\w\d]+"),
   ("address", r"0x[0-9a-fA-F]+"),
   ("number", r"[0-9]{4,}"),
 ];
@@ -58,6 +61,8 @@ pub struct State<'a> {
   pub lines: &'a Vec<&'a str>,
   alphabet: &'a str,
   regexp: &'a Vec<&'a str>,
+  exclude: Vec<String>,
+  exclude_regexp: Vec<String>,
 }
 
 impl<'a> State<'a> {
@@ -66,26 +71,62 @@ impl<'a> State<'a> {
       lines,
       alphabet,
       regexp,
+      exclude: Vec::new(),
+      exclude_regexp: Vec::new(),
     }
+  }
+
+  /// Names from PATTERNS to drop entirely, comma separated. `--regexp` can only
+  /// ADD a pattern, so without this there is no way to stop a built-in whose
+  /// hints are always noise on a given screen: `ipv6` matches the clock time
+  /// `3:54`, `number` matches every `100644` file mode in a diff header.
+  pub fn exclude(mut self, names: &str) -> State<'a> {
+    self.exclude = names
+      .split(',')
+      .map(|name| name.trim().to_string())
+      .filter(|name| !name.is_empty())
+      .collect();
+    self
+  }
+
+  /// Extra patterns that are matched and SKIPPED PAST without being hinted,
+  /// joining the two EXCLUDE_PATTERNS above. This is the only way to suppress
+  /// junk that a useful pattern produces, so the pattern itself has to stay:
+  /// the `path` built-in reads the `</span>` in HTML output as the path `/span`,
+  /// and `path` is far too useful to drop. The regex crate has no lookbehind,
+  /// so `(?<!<)/\w+` is not an option either.
+  pub fn exclude_regexp(mut self, patterns: &[&str]) -> State<'a> {
+    self.exclude_regexp = patterns.iter().map(|p| p.to_string()).collect();
+    self
   }
 
   pub fn matches(&self, reverse: bool, unique: bool) -> Vec<Match<'a>> {
     let mut matches = Vec::new();
 
+    // The third element is whether a win gets a hint. False means "consume the
+    // match and move on", which is how an exclude suppresses a pattern it
+    // cannot be allowed to delete.
     let exclude_patterns = EXCLUDE_PATTERNS
       .iter()
-      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
+      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap(), false))
+      .chain(
+        self
+          .exclude_regexp
+          .iter()
+          .map(|regexp| ("exclude", Regex::new(regexp).expect("Invalid exclude regexp"), false)),
+      )
       .collect::<Vec<_>>();
 
     let custom_patterns = self
       .regexp
       .iter()
-      .map(|regexp| ("custom", Regex::new(regexp).expect("Invalid custom regexp")))
+      .map(|regexp| ("custom", Regex::new(regexp).expect("Invalid custom regexp"), true))
       .collect::<Vec<_>>();
 
     let patterns = PATTERNS
       .iter()
-      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap()))
+      .filter(|tuple| !self.exclude.iter().any(|name| name == tuple.0))
+      .map(|tuple| (tuple.0, Regex::new(tuple.1).unwrap(), true))
       .collect::<Vec<_>>();
 
     // This order determines the priority of pattern matching
@@ -100,16 +141,16 @@ impl<'a> State<'a> {
         let submatches = all_patterns
           .iter()
           .filter_map(|tuple| match tuple.1.find_iter(chunk).nth(0) {
-            Some(m) => Some((tuple.0, tuple.1.clone(), m)),
+            Some(m) => Some((tuple.0, tuple.1.clone(), tuple.2, m)),
             None => None,
           })
           .collect::<Vec<_>>();
 
         // Then, we search for the match with the lowest index
-        let first_match_option = submatches.iter().min_by(|x, y| x.2.start().cmp(&y.2.start()));
+        let first_match_option = submatches.iter().min_by(|x, y| x.3.start().cmp(&y.3.start()));
 
         if let Some(first_match) = first_match_option {
-          let (name, pattern, matching) = first_match;
+          let (name, pattern, emit, matching) = first_match;
           let text = matching.as_str();
 
           if let Some(captures) = pattern.captures(text) {
@@ -126,8 +167,11 @@ impl<'a> State<'a> {
               [(matching.as_str(), 0)].to_vec()
             };
 
-            // Never hint or broke bash color sequences, but process it
-            if *name != "bash" {
+            // An excluded match is still consumed, so it cannot be re-matched
+            // by a later pattern -- that is the point for bash colour
+            // sequences, and it is what makes an exclude regexp suppress the
+            // junk a pattern we are keeping would otherwise emit.
+            if *emit {
               for (subtext, substart) in captures.iter() {
                 matches.push(Match {
                   x: offset + matching.start() as i32 + *substart as i32,
@@ -194,6 +238,114 @@ mod tests {
 
   fn split(output: &str) -> Vec<&str> {
     output.split("\n").collect::<Vec<&str>>()
+  }
+
+  fn texts<'a>(matches: &'a [Match<'a>]) -> Vec<&'a str> {
+    matches.iter().map(|m| m.text).collect()
+  }
+
+  #[test]
+  fn exclude_drops_a_builtin_by_name() {
+    // The ipv6 pattern reads a clock time as an address: 3 + : + 5 + 4.
+    let lines = split("done 3:54 PM");
+    let custom = [].to_vec();
+
+    let kept = State::new(&lines, "abcd", &custom).matches(false, false);
+    assert_eq!(texts(&kept), vec!["3:54"]);
+
+    let dropped = State::new(&lines, "abcd", &custom)
+      .exclude("ipv6")
+      .matches(false, false);
+    assert!(dropped.is_empty());
+  }
+
+  #[test]
+  fn exclude_takes_a_list_and_ignores_spacing() {
+    let lines = split("mode 100644 at 3:54");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom)
+      .exclude(" number , ipv6 ")
+      .matches(false, false);
+
+    assert!(results.is_empty());
+  }
+
+  #[test]
+  fn exclude_leaves_the_other_patterns_alone() {
+    let lines = split("see /etc/hosts at 3:54");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom)
+      .exclude("ipv6")
+      .matches(false, false);
+
+    assert_eq!(texts(&results), vec!["/etc/hosts"]);
+  }
+
+  #[test]
+  fn an_unknown_exclude_name_is_a_no_op() {
+    let lines = split("done 3:54 PM");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom)
+      .exclude("nosuchpattern")
+      .matches(false, false);
+
+    assert_eq!(texts(&results), vec!["3:54"]);
+  }
+
+  #[test]
+  fn exclude_regexp_suppresses_junk_from_a_pattern_we_keep() {
+    // `path` reads the closing tag as the path `/span`, and path is far too
+    // useful to drop wholesale -- the real path on the same line must survive.
+    let lines = split("<span>x</span> in /etc/hosts");
+    let custom = [].to_vec();
+
+    let kept = State::new(&lines, "abcd", &custom).matches(false, false);
+    assert_eq!(texts(&kept), vec!["/span", "/etc/hosts"]);
+
+    let suppressed = State::new(&lines, "abcd", &custom)
+      .exclude_regexp(&["</\\w+>"])
+      .matches(false, false);
+    assert_eq!(texts(&suppressed), vec!["/etc/hosts"]);
+  }
+
+  #[test]
+  fn exclude_regexp_wins_a_tie_against_a_custom_pattern() {
+    // Same start column: the exclude list is concatenated first, and min_by
+    // keeps the first of equal minimums.
+    let lines = split("console.log(x)");
+    let custom = ["(?P<match>[\\w.]+\\.log)"].to_vec();
+
+    let kept = State::new(&lines, "abcd", &custom).matches(false, false);
+    assert_eq!(texts(&kept), vec!["console.log"]);
+
+    let suppressed = State::new(&lines, "abcd", &custom)
+      .exclude_regexp(&["console\\.log"])
+      .matches(false, false);
+    assert!(suppressed.is_empty());
+  }
+
+  #[test]
+  fn ipv6_no_longer_matches_bracket_characters() {
+    // `[A-f]` was a range spanning 0x41-0x66, so it swallowed `[`, `\`, `]`,
+    // `^`, `_` and a backtick.
+    let lines = split("row 6:[Alpha]");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert!(
+      !texts(&results).iter().any(|t| t.contains('[')),
+      "ipv6 matched a bracket: {:?}",
+      texts(&results)
+    );
+  }
+
+  #[test]
+  fn ipv6_still_matches_an_address() {
+    let lines = split("bound to fe80::1ff:fe23:4567:890a here");
+    let custom = [].to_vec();
+    let results = State::new(&lines, "abcd", &custom).matches(false, false);
+
+    assert_eq!(texts(&results), vec!["fe80::1ff:fe23:4567:890a"]);
   }
 
   #[test]

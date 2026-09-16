@@ -172,6 +172,7 @@ impl<'a> Swapper<'a> {
 
           let string_params = vec![
             "alphabet",
+            "exclude",
             "position",
             "fg-color",
             "bg-color",
@@ -185,6 +186,15 @@ impl<'a> Swapper<'a> {
 
           if string_params.iter().any(|&x| x == name) {
             return vec![format!("--{}", name), format!("'{}'", value)];
+          }
+
+          // Numbered like @thumbs-regexp-N, because a tmux option holds one
+          // value and a screen needs more than one thing suppressed.
+          if name.starts_with("exclude-regexp") {
+            return vec![
+              "--exclude-regexp".to_string(),
+              format!("'{}'", value.replace("\\\\", "\\")),
+            ];
           }
 
           if name.starts_with("regexp") {

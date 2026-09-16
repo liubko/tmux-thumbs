@@ -124,6 +124,20 @@ fn app_args<'a>() -> clap::ArgMatches<'a> {
         .multiple(true),
     )
     .arg(
+      Arg::with_name("exclude")
+        .help("Drop these built-in patterns by name, comma separated")
+        .long("exclude")
+        .takes_value(true)
+        .default_value(""),
+    )
+    .arg(
+      Arg::with_name("exclude_regexp")
+        .help("Match this regexp but never hint it, skipping past it")
+        .long("exclude-regexp")
+        .takes_value(true)
+        .multiple(true),
+    )
+    .arg(
       Arg::with_name("contrast")
         .help("Put square brackets around hint for visibility")
         .long("contrast")
@@ -154,6 +168,12 @@ fn main() {
   } else {
     [].to_vec()
   };
+  let exclude = args.value_of("exclude").unwrap();
+  let exclude_regexp = if let Some(items) = args.values_of("exclude_regexp") {
+    items.collect::<Vec<_>>()
+  } else {
+    [].to_vec()
+  };
 
   let foreground_color = colors::get_color(args.value_of("foreground_color").unwrap());
   let background_color = colors::get_color(args.value_of("background_color").unwrap());
@@ -172,7 +192,9 @@ fn main() {
 
   let lines = output.split('\n').collect::<Vec<&str>>();
 
-  let mut state = state::State::new(&lines, alphabet, &regexp);
+  let mut state = state::State::new(&lines, alphabet, &regexp)
+    .exclude(exclude)
+    .exclude_regexp(&exclude_regexp);
 
   let selected = {
     let mut viewbox = view::View::new(
