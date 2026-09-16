@@ -496,6 +496,55 @@ mod tests {
   }
 
   #[test]
+  fn exclude_options_reach_the_binary() {
+    // Popped from the end: the active-pane listing first, then the `tmux show
+    // -g` output that the option parsing reads.
+    let last_command_outputs = vec![
+      "".to_string(),
+      "@thumbs-exclude ipv6,number\n@thumbs-exclude-regexp-1 </\\\\w+>\n@thumbs-exclude-regexp-2 \\\\bconsole\\\\.log\\\\b\n@thumbs-regexp-1 (?P<match>foo)\n".to_string(),
+      "%97:100:24:1:0:active\n".to_string(),
+    ];
+    let mut executor = TestShell::new(last_command_outputs);
+    let mut swapper = Swapper::new(
+      Box::new(&mut executor),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      "".to_string(),
+      false,
+    );
+
+    swapper.capture_active_pane();
+    swapper.execute_thumbs();
+
+    let executed = executor.last_executed().unwrap().join(" ");
+
+    assert!(
+      executed.contains("--exclude 'ipv6,number'"),
+      "no --exclude in: {}",
+      executed
+    );
+    // The doubled backslashes in a tmux option value are unescaped on the way
+    // through, same as --regexp.
+    assert!(
+      executed.contains("--exclude-regexp '</\\w+>'"),
+      "no first --exclude-regexp in: {}",
+      executed
+    );
+    assert!(
+      executed.contains("--exclude-regexp '\\bconsole\\.log\\b'"),
+      "no second --exclude-regexp in: {}",
+      executed
+    );
+    // exclude-regexp must not be mistaken for a --regexp.
+    assert!(
+      executed.contains("--regexp '(?P<match>foo)'"),
+      "no --regexp in: {}",
+      executed
+    );
+  }
+
+  #[test]
   fn quoted_execution() {
     let last_command_outputs = vec!["Blah blah blah, the ignored user script output".to_string()];
     let mut executor = TestShell::new(last_command_outputs);
